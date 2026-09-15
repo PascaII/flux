@@ -4,7 +4,7 @@ use rustc_hash::FxHashMap;
 use syn::{Attribute, Ident, Type, Visibility};
 
 use super::parse::{AddField, EvolutionOp, EvolveInput, EvolveStruct, ModifyField, StructField};
-use crate::shared::is_closure;
+use crate::shared::{is_closure, without_schema_attrs};
 
 pub(crate) struct FieldInfo {
     pub attrs: Vec<Attribute>,
@@ -73,12 +73,13 @@ pub(crate) fn generate_struct_def(
 }
 
 pub(crate) fn generate_base_struct(input: &EvolveInput) -> (TokenStream2, Vec<FieldInfo>) {
+    let is_final = input.evolutions.is_empty();
     let fields: Vec<_> = input
         .base
         .items
         .iter()
         .map(|f| {
-            let attrs = &f.attrs;
+            let attrs = emitted_attrs(&f.attrs, is_final);
             let vis = &f.vis;
             let name = &f.name;
             let ty = &f.ty;
@@ -94,9 +95,17 @@ pub(crate) fn generate_base_struct(input: &EvolveInput) -> (TokenStream2, Vec<Fi
     (output, field_infos)
 }
 
+/// Field attributes for an emitted version: schema-only attributes survive
+/// only on the final, queryable version, while the accumulated `FieldInfo`
+/// keeps them for later steps. Version-level attributes are never stripped.
+fn emitted_attrs(attrs: &[Attribute], is_final: bool) -> Vec<Attribute> {
+    if is_final { attrs.to_vec() } else { without_schema_attrs(attrs) }
+}
+
 fn generate_evolved_struct_fields(
     kept_fields: &[&FieldInfo],
     ctx: &EvolutionContext,
+    is_final: bool,
 ) -> Vec<TokenStream2> {
     kept_fields
         .iter()
@@ -106,13 +115,13 @@ fn generate_evolved_struct_fields(
 
             ctx.modify_map.get(&name_str).map_or_else(
                 || {
-                    let attrs = &f.attrs;
+                    let attrs = emitted_attrs(&f.attrs, is_final);
                     let vis = &f.vis;
                     let ty = &f.ty;
                     quote! { #(#attrs)* #vis #name: #ty }
                 },
                 |modify| {
-                    let attrs = &modify.attrs;
+                    let attrs = emitted_attrs(&modify.attrs, is_final);
                     let vis = &f.vis;
                     let ty = &modify.new_ty;
                     quote! { #(#attrs)* #vis #name: #ty }
@@ -120,7 +129,7 @@ fn generate_evolved_struct_fields(
             )
         })
         .chain(ctx.add_fields.iter().map(|f| {
-            let attrs = &f.attrs;
+            let attrs = emitted_attrs(&f.attrs, is_final);
             let vis = &f.vis;
             let name = &f.name;
             let ty = &f.ty;
@@ -222,13 +231,14 @@ pub(crate) fn generate_evolution(
     default_attrs: &[Attribute],
     current_fields: &[FieldInfo],
     prev_name: &Ident,
+    is_final: bool,
 ) -> (TokenStream2, Vec<FieldInfo>) {
     let ctx = EvolutionContext::from_evolution(evolution);
 
     let kept_fields: Vec<_> =
         current_fields.iter().filter(|f| !ctx.remove_names.contains(&f.name.to_string())).collect();
 
-    let struct_fields = generate_evolved_struct_fields(&kept_fields, &ctx);
+    let struct_fields = generate_evolved_struct_fields(&kept_fields, &ctx, is_final);
     let struct_def =
         generate_struct_def(&evolution.name, default_attrs, &evolution.attrs, &struct_fields);
     let into_impl = generate_into_impl(prev_name, &evolution.name, &kept_fields, &ctx);
