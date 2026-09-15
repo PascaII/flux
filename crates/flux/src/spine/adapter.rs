@@ -9,8 +9,8 @@ use signal_hook::consts::SIGINT;
 
 use crate::{
     spine::{
-        FluxSpine, SpineConsumer, SpineDCacheConsumer, SpineProducer, SpineProducerWithDCache,
-        SpineProducers,
+        DCacheRead, FluxSpine, SpineConsumer, SpineDCacheConsumer, SpineProducer,
+        SpineProducerWithDCache, SpineProducers,
     },
     tile::Tile,
 };
@@ -242,80 +242,98 @@ impl<S: FluxSpine> SpineAdapter<S> {
         consumed
     }
 
-    /// Drains intact messages from a dcache-backed queue.
-    ///
-    /// `read` is called only for messages with a payload. After the payload's
-    /// epoch is validated, `handle` receives the message and `Some` of the
-    /// value returned by `read`. A message produced without a payload is
-    /// passed directly to `handle` with `None`. Overrun and lost payload
-    /// outcomes are never passed to `handle`; `read` may already have
-    /// run when an epoch check detects a lost payload.
     #[inline]
-    pub fn consume_with_dcache<T, R, F, G>(&mut self, mut read: F, mut handle: G)
+    /// Drains the queue, passing every outcome except an empty queue to
+    /// `handle`. Returns whether `handle` ran at least once.
+    pub fn consume_with_dcache<T, R, F, G>(&mut self, mut read: F, mut handle: G) -> bool
     where
         T: 'static + Copy,
         S::Consumers: AsMut<SpineDCacheConsumer<T>>,
         S::Producers: SpineProducers,
         F: FnMut(T, &[u8]) -> R,
-        G: FnMut(T, Option<R>, &mut S::Producers),
+        G: FnMut(DCacheRead<T, R>, &mut S::Producers),
     {
         let c: &mut SpineDCacheConsumer<T> = self.consumers.as_mut();
-        while c.consume(&mut self.producers, &mut read, &mut handle) {
-            self.did_work = true;
+        let mut handled = false;
+        while let Some(result) = c.consume(&mut self.producers, &mut read) {
+            self.did_work |= !matches!(result, DCacheRead::SpedPast);
+            handle(result, &mut self.producers);
+            handled = true;
         }
+        handled
     }
 
-    /// Consumes at most one intact message from the shared collaborative
-    /// cursor. Callback behavior matches [`Self::consume_with_dcache`].
     #[inline]
-    pub fn consume_with_dcache_collaborative<T, R, F, G>(&mut self, mut read: F, mut handle: G)
+    /// Consumes at most one message, passing it to `handle`. Returns whether
+    /// `handle` ran.
+    pub fn consume_with_dcache_collaborative<T, R, F, G>(
+        &mut self,
+        mut read: F,
+        mut handle: G,
+    ) -> bool
     where
         T: 'static + Copy,
         S::Consumers: AsMut<SpineDCacheConsumer<T>>,
         S::Producers: SpineProducers,
         F: FnMut(T, &[u8]) -> R,
-        G: FnMut(T, Option<R>, &mut S::Producers),
+        G: FnMut(DCacheRead<T, R>, &mut S::Producers),
     {
         let c: &mut SpineDCacheConsumer<T> = self.consumers.as_mut();
-        if c.consume_collaborative(&mut self.producers, &mut read, &mut handle) {
-            self.did_work = true;
-        }
+        let Some(result) = c.consume_collaborative(&mut self.producers, &mut read) else {
+            return false;
+        };
+        self.did_work |= !matches!(result, DCacheRead::SpedPast);
+        handle(result, &mut self.producers);
+        true
     }
 
+    #[inline]
     /// Internal-message variant of [`Self::consume_with_dcache`].
-    #[inline]
-    pub fn consume_with_dcache_internal_message<T, R, F, G>(&mut self, mut read: F, mut handle: G)
+    pub fn consume_with_dcache_internal_message<T, R, F, G>(
+        &mut self,
+        mut read: F,
+        mut handle: G,
+    ) -> bool
     where
         T: 'static + Copy,
         S::Consumers: AsMut<SpineDCacheConsumer<T>>,
         S::Producers: SpineProducers,
         F: FnMut(&InternalMessage<T>, &[u8]) -> R,
-        G: FnMut(InternalMessage<T>, Option<R>, &mut S::Producers),
+        G: FnMut(DCacheRead<InternalMessage<T>, R>, &mut S::Producers),
     {
         let c: &mut SpineDCacheConsumer<T> = self.consumers.as_mut();
-        while c.consume_internal_message(&mut self.producers, &mut read, &mut handle) {
-            self.did_work = true;
+        let mut handled = false;
+        while let Some(result) = c.consume_internal_message(&mut self.producers, &mut read) {
+            self.did_work |= !matches!(result, DCacheRead::SpedPast);
+            handle(result, &mut self.producers);
+            handled = true;
         }
+        handled
     }
 
+    #[inline]
     /// Internal-message variant of
     /// [`Self::consume_with_dcache_collaborative`].
-    #[inline]
     pub fn consume_with_dcache_collaborative_internal_message<T, R, F, G>(
         &mut self,
         mut read: F,
         mut handle: G,
-    ) where
+    ) -> bool
+    where
         T: 'static + Copy,
         S::Consumers: AsMut<SpineDCacheConsumer<T>>,
         S::Producers: SpineProducers,
         F: FnMut(&InternalMessage<T>, &[u8]) -> R,
-        G: FnMut(InternalMessage<T>, Option<R>, &mut S::Producers),
+        G: FnMut(DCacheRead<InternalMessage<T>, R>, &mut S::Producers),
     {
         let c: &mut SpineDCacheConsumer<T> = self.consumers.as_mut();
-        if c.consume_collaborative_internal_message(&mut self.producers, &mut read, &mut handle) {
-            self.did_work = true;
-        }
+        let Some(result) = c.consume_collaborative_internal_message(&mut self.producers, &mut read)
+        else {
+            return false;
+        };
+        self.did_work |= !matches!(result, DCacheRead::SpedPast);
+        handle(result, &mut self.producers);
+        true
     }
 
     /// Override the collaborative group label for queue `T`. By default each
