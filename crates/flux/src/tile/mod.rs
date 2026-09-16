@@ -49,6 +49,11 @@ pub trait Tile<S: FluxSpine>: Send + Sized {
     /// `adapter.mark_work()`.
     fn loop_body(&mut self, _adapter: &mut SpineAdapter<S>);
 
+    /// Called once on the attaching thread after adapter construction, before
+    /// the worker starts. Use this to establish broadcast subscriptions
+    /// before starting producers.
+    fn on_attach(&mut self, _adapter: &mut SpineAdapter<S>) {}
+
     /// User init before loop. State setup etc.
     /// Called repeatedly until it returns true.
     fn try_init(&mut self, _adapter: &mut SpineAdapter<S>) -> bool {
@@ -102,6 +107,7 @@ where
     let stop_flag = spine.stop_flag.clone();
     let mut adapter =
         SpineAdapter::connect_tile_with_stop_flag(&tile, spine.spine, stop_flag.clone());
+    tile.on_attach(&mut adapter);
     let mut metrics = if config.metrics {
         Some(TileMetrics::new(spine.spine.base_dir(), S::app_name(), tile.name()))
     } else {

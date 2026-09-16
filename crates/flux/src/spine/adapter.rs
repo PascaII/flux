@@ -135,6 +135,17 @@ impl<S: FluxSpine> SpineAdapter<S> {
         Ok(())
     }
 
+    /// Subscribe to future broadcasts of `T` without consuming; repeated calls
+    /// are no-ops.
+    #[inline]
+    pub fn subscribe_broadcast<T: 'static + Copy>(&mut self)
+    where
+        S::Consumers: AsMut<SpineConsumer<T>>,
+    {
+        let c = self.consumers.as_mut();
+        c.inner.subscribe_broadcast();
+    }
+
     #[inline]
     pub fn consume<T, F>(&mut self, mut f: F)
     where

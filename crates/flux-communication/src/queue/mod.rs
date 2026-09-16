@@ -817,6 +817,14 @@ impl<T: Copy> ConsumerBare<T> {
         self.acquire_specific_slot(delta);
     }
 
+    /// Start at the current write head without consuming; repeated calls are
+    /// no-ops. Otherwise, subscription starts on the first read. Queue
+    /// overwrite still applies. For broadcast consumption only.
+    #[inline]
+    pub fn subscribe_broadcast(&mut self) {
+        self.try_init_broadcast();
+    }
+
     #[inline]
     fn try_init_broadcast(&mut self) {
         if self.cursor.is_null() {
@@ -976,6 +984,12 @@ impl<T: 'static + Copy> Consumer<T> {
     #[cfg(test)]
     pub fn new_collaborative_test(queue: Queue<T>, label: &'static str) -> Self {
         Self::from_bare(ConsumerBare::new_collaborative_test(queue, label))
+    }
+
+    /// Subscribe without consuming; see [`ConsumerBare::subscribe_broadcast`].
+    #[inline]
+    pub fn subscribe_broadcast(&mut self) {
+        self.bare.subscribe_broadcast();
     }
 
     /// Maybe consume one message in a queue with error recovery and logging,
