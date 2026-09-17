@@ -326,6 +326,10 @@ impl BlobCache {
         self.buffers.values().map(|buf| buf.n_messages as usize).sum()
     }
 
+    pub fn n_blobs(&self) -> usize {
+        self.buffers.values().filter(|buf| buf.n_messages > 0).count()
+    }
+
     /// The `&Blob` is valid only inside `sink`.
     pub fn flush<U: Versioned>(
         &mut self,
