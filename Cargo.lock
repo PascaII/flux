@@ -1377,6 +1377,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "flux-clickhouse"
+version = "0.3.2"
+dependencies = [
+ "flux-network",
+ "serde",
+]
+
+[[package]]
 name = "flux-communication"
 version = "0.3.2"
 dependencies = [
