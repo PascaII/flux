@@ -7,6 +7,7 @@ members = [
   "crates/flux-disk",
   "crates/flux-gather",
   "crates/flux-network",
+  "crates/flux-postgres",
   "crates/flux-profiler",
   "crates/flux-profiler-macros",
   "crates/flux-timekeeper",
@@ -35,6 +36,7 @@ version = "0.3.2"
 byte-stable = { path = "crates/byte-stable" }
 byte-stable-derive = { path = "crates/byte-stable-derive" }
 flux = { path = "crates/flux" }
+flux-clickhouse = { path = "crates/flux-clickhouse" }
 flux-communication = { path = "crates/flux-communication" }
 flux-disk = { path = "crates/flux-disk" }
 flux-network = { path = "crates/flux-network" }
@@ -52,6 +54,7 @@ type-hash-derive = { path = "crates/type-hash-derive" }
 
 alloy-primitives = "1"
 auto_impl = "1.2.0"
+base64 = "0.22"
 bincode = "1.3.3"
 bitcode = { features = ["serde"], version = "0.6.3" }
 bitflags = { version = "2.6.0", features = ["serde"] }
@@ -66,6 +69,7 @@ crossterm = "0.28.1"
 ctrlc = "3"
 directories = "5.0.1"
 governor = "0.6.3"
+hmac = "0.12"
 httparse = "1"
 humantime = "2.1"
 indexmap = { features = ["serde"], version = "2.11.1" }
@@ -81,6 +85,7 @@ ratatui = "0.29.0"
 rustc-hash = "2"
 serde = { features = ["derive"], version = "1.0" }
 serde_json = "1.0.135"
+sha2 = "0.10"
 shared_memory = "^0.12"
 signal-hook = "0.3.18"
 spin = "0.10"
