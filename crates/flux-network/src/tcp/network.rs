@@ -16,6 +16,7 @@ use super::{
         set_user_timeout, write_frame_header, write_frame_len, write_frame_ts,
     },
 };
+use crate::tls::Session;
 
 const EVENTS_CAPACITY: usize = 128;
 const INITIAL_CONNECTION_CAPACITY: usize = 8;
@@ -210,6 +211,9 @@ pub struct TcpGroupConfig {
     pub user_timeout_ms: u32,
     /// Retry interval for persistent outbound endpoints.
     pub reconnect_interval: Duration,
+    /// How long a TLS handshake may stay incomplete before the connection is
+    /// dropped and, for outbound endpoints, redialled.
+    pub handshake_timeout: Duration,
     /// Emit rate-limited warnings above this many queued bytes. The queue is
     /// allowed to continue growing.
     pub backlog_warn_bytes: Option<usize>,
@@ -235,6 +239,7 @@ impl Default for TcpGroupConfig {
             keepalive: false,
             user_timeout_ms: DEFAULT_TCP_USER_TIMEOUT_MS,
             reconnect_interval: Duration::from_secs(2),
+            handshake_timeout: Duration::from_secs(10),
             backlog_warn_bytes: Some(DEFAULT_BACKLOG_WARN_BYTES),
             max_backlog_bytes: None,
             max_frame_size: DEFAULT_MAX_FRAME_SIZE,
@@ -298,6 +303,22 @@ struct Connection {
     state: ConnectionState,
     close_when_drained: bool,
     timers: Option<NetworkTimers>,
+    /// Client TLS for this endpoint; `None` leaves the wire in plaintext.
+    /// Boxed so a plaintext connection carries a pointer, not a session.
+    tls: Option<Box<Session>>,
+}
+
+impl Connection {
+    /// Whether a TLS connection is still negotiating and cannot carry
+    /// application bytes yet.
+    fn is_handshaking(&self) -> bool {
+        self.tls.as_ref().is_some_and(|tls| tls.is_handshaking())
+    }
+    /// Whether this connection has been reported as established. Plaintext
+    /// connections are announced as soon as the socket connects.
+    fn announced(&self) -> bool {
+        self.tls.as_ref().is_none_or(|tls| tls.announced())
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -345,6 +366,8 @@ struct NetworkState {
     /// `[header][payload]` for length-prefixed groups or bare bytes for raw
     /// groups.
     send_buffer: Vec<u8>,
+    /// Staged frames encrypted for one TLS connection.
+    tls_buffer: Vec<u8>,
 }
 
 impl NetworkState {
@@ -358,6 +381,7 @@ impl NetworkState {
             next_token: tokens.start,
             token_range: tokens,
             send_buffer: Vec::with_capacity(INITIAL_SEND_BUFFER_SIZE),
+            tls_buffer: Vec::new(),
         }
     }
 
@@ -388,7 +412,12 @@ impl NetworkState {
         Ok(())
     }
 
-    fn connect(&mut self, group: TcpGroup, peer_addr: SocketAddr) -> Token {
+    fn connect(
+        &mut self,
+        group: TcpGroup,
+        peer_addr: SocketAddr,
+        tls: Option<Box<Session>>,
+    ) -> Token {
         assert!(group.0 < self.groups.len(), "unknown TCP group");
         let token = self.next_token();
         let config = self.config(group);
@@ -402,6 +431,7 @@ impl NetworkState {
             state: ConnectionState::Disconnected,
             close_when_drained: false,
             timers,
+            tls,
         });
         self.start_connect(self.connections.len() - 1);
         token
@@ -436,6 +466,21 @@ impl NetworkState {
         self.connections[index].state = ConnectionState::Connecting(socket);
     }
 
+    /// Drops TLS connections whose handshake never finished. They are
+    /// redialled by the usual reconnect sweep; no lifecycle event is emitted
+    /// because none was ever announced.
+    /// Drops a TLS connection whose handshake never finished, so the sweep
+    /// below redials it. Nothing is emitted: it was never announced.
+    fn drop_stalled_handshake(&mut self, index: usize) {
+        let timeout = self.config(self.connections[index].group).handshake_timeout;
+        if !self.connections[index].tls.as_ref().is_some_and(|tls| tls.handshake_stalled(timeout)) {
+            return;
+        }
+        let peer_addr = self.connections[index].peer_addr;
+        warn!(%peer_addr, ?timeout, "tls handshake timed out");
+        self.disconnect_index(index, false);
+    }
+
     fn maybe_reconnect(&mut self) {
         let now = Instant::now();
         for group_index in 0..self.groups.len() {
@@ -443,6 +488,13 @@ impl NetworkState {
                 continue;
             }
             let group = TcpGroup(group_index);
+            // Swept on the reconnect tick, so a poll with no reconnect work
+            // pays nothing for it; the timeout is coarse by that interval.
+            for index in 0..self.connections.len() {
+                if self.connections[index].group == group {
+                    self.drop_stalled_handshake(index);
+                }
+            }
             for index in 0..self.connections.len() {
                 if self.connections[index].group == group &&
                     self.connections[index].kind == ConnectionKind::Outbound &&
@@ -499,6 +551,12 @@ impl NetworkState {
         let group = self.connections[index].group;
         let peer_addr = self.connections[index].peer_addr;
         let mut timers = self.connections[index].timers;
+        // Opens the handshake before the group config is borrowed below.
+        let is_tls = self.connections[index].tls.is_some();
+        let mut handshake = Vec::new();
+        if let Some(tls) = self.connections[index].tls.as_mut() {
+            tls.start(&mut handshake);
+        }
         let config = self.config(group);
         let group_name = config.name;
 
@@ -526,8 +584,12 @@ impl NetworkState {
         }
 
         let mut stream = FramedStream::new(socket, token, peer_addr, config.max_frame_size);
-        if let Some(message) = config.on_connect_msg.as_deref() {
-            let header = (config.framing == Framing::LengthPrefixed).then(|| {
+        // TLS sends its opening flight here; `on_connect_msg` waits for the
+        // finished handshake so it travels encrypted.
+        let first = if is_tls { Some(&handshake[..]) } else { config.on_connect_msg.as_deref() };
+        if let Some(message) = first {
+            // Handshake records are the wire itself and are never framed.
+            let header = (!is_tls && config.framing == Framing::LengthPrefixed).then(|| {
                 let mut header = [0; FRAME_HEADER_SIZE];
                 write_frame_header(&mut header, message.len(), Nanos::now());
                 header
@@ -544,7 +606,9 @@ impl NetworkState {
         self.connections[index].timers = timers;
         self.connections[index].state = ConnectionState::Connected(stream);
         info!(group = group_name, %peer_addr, "tcp connection established");
-        handler(TcpEvent::Connected { group, token, peer_addr });
+        if !is_tls {
+            handler(TcpEvent::Connected { group, token, peer_addr });
+        }
         true
     }
 
@@ -627,6 +691,7 @@ impl NetworkState {
                 state: ConnectionState::Connected(stream),
                 close_when_drained: false,
                 timers,
+                tls: None,
             });
             info!(group = group_name, %peer_addr, "tcp connection accepted");
             handler(TcpEvent::Accepted { group, token, peer_addr });
@@ -668,6 +733,7 @@ impl NetworkState {
                 event,
                 config,
                 &mut connection.timers,
+                &mut connection.tls,
                 &mut |payload, send_ts| {
                     handler(TcpEvent::Message { group, token, payload, send_ts });
                 },
@@ -675,10 +741,27 @@ impl NetworkState {
             (state, stream.send_queue.is_empty())
         };
         if state == StreamState::Disconnected {
-            handler(TcpEvent::Disconnected { group, token, peer_addr });
+            // A handshake that never completed was never announced.
+            if self.connections[index].announced() {
+                handler(TcpEvent::Disconnected { group, token, peer_addr });
+            }
             self.disconnect_index(index, false);
         } else if self.connections[index].close_when_drained && queue_empty {
             self.disconnect_index(index, true);
+        } else if self.connections[index].tls.as_ref().is_some_and(|tls| tls.handshake_completed())
+        {
+            // The encrypted connection is usable now; `on_connect_msg` goes
+            // out through the normal send path so it is encrypted too.
+            if let Some(message) = self.groups[group.0].config.on_connect_msg.clone() &&
+                !self.send_with(token, |buf| buf.extend_from_slice(&message))
+            {
+                return;
+            }
+            // Marked only here, so anything dropped earlier stays silent.
+            if let Some(tls) = self.connections[index].tls.as_mut() {
+                tls.mark_announced();
+            }
+            handler(TcpEvent::Connected { group, token, peer_addr });
         }
     }
 
@@ -734,6 +817,7 @@ impl NetworkState {
         self.connections.iter().position(|connection| {
             connection.token == token &&
                 !connection.close_when_drained &&
+                !connection.is_handshaking() &&
                 matches!(connection.state, ConnectionState::Connected(_))
         })
     }
@@ -796,16 +880,30 @@ impl NetworkState {
     /// accepted or queued.
     fn write_staged(&mut self, index: usize) -> bool {
         let group = self.connections[index].group;
-        let config = &self.groups[group.0].config;
-        let connection = &mut self.connections[index];
-        let ConnectionState::Connected(stream) = &mut connection.state else { unreachable!() };
-        let state = stream.write_frame(
-            &self.registry,
-            None,
-            &self.send_buffer,
-            config,
-            &mut connection.timers,
-        );
+        let state = {
+            let Self { groups, connections, registry, send_buffer, tls_buffer, .. } = self;
+            let config = &groups[group.0].config;
+            let connection = &mut connections[index];
+            // TLS carries the staged frames as records, so the whole buffer
+            // is encrypted and written unframed.
+            let encrypted = connection.tls.as_mut().map(|session| {
+                tls_buffer.clear();
+                session.encrypt(send_buffer, tls_buffer)
+            });
+            let payload = match encrypted {
+                None => Some(&send_buffer[..]),
+                Some(true) => Some(&tls_buffer[..]),
+                // The session is dead and can no longer produce records.
+                Some(false) => None,
+            };
+            let ConnectionState::Connected(stream) = &mut connection.state else { unreachable!() };
+            match payload {
+                Some(payload) => {
+                    stream.write_frame(registry, None, payload, config, &mut connection.timers)
+                }
+                None => StreamState::Disconnected,
+            }
+        };
         if state == StreamState::Disconnected {
             self.disconnect_index(index, true);
             return false;
@@ -856,6 +954,7 @@ impl NetworkState {
             self.connections.iter().any(|connection| {
                 connection.group == group &&
                     !connection.close_when_drained &&
+                    !connection.is_handshaking() &&
                     matches!(connection.state, ConnectionState::Connected(_))
             })
     }
@@ -870,6 +969,7 @@ impl NetworkState {
             index -= 1;
             if self.connections[index].group != group ||
                 self.connections[index].close_when_drained ||
+                self.connections[index].is_handshaking() ||
                 !matches!(self.connections[index].state, ConnectionState::Connected(_))
             {
                 continue;
@@ -1081,7 +1181,15 @@ impl TcpNetworkCore {
     /// The returned token remains stable across reconnects.
     #[must_use = "the token identifies the persistent outbound endpoint"]
     pub fn connect(&mut self, group: TcpGroup, peer_addr: SocketAddr) -> Token {
-        self.state.connect(group, peer_addr)
+        self.state.connect(group, peer_addr, None)
+    }
+
+    /// Like [`Self::connect`] but negotiates client TLS once the socket
+    /// connects. [`TcpEvent::Connected`] is emitted after the handshake, and
+    /// every payload is encrypted; framing applies inside the session.
+    #[must_use = "the token identifies the persistent outbound endpoint"]
+    pub fn connect_tls(&mut self, group: TcpGroup, peer_addr: SocketAddr, tls: Session) -> Token {
+        self.state.connect(group, peer_addr, Some(Box::new(tls)))
     }
 
     /// Serializes and sends one payload to a connected token. Length-prefixed
@@ -1269,6 +1377,18 @@ impl TcpNetworkWithExternalPoll {
     }
 }
 
+/// Reads plaintext from `socket`, decrypting through `tls` when present.
+fn read_plaintext(
+    socket: &mut mio::net::TcpStream,
+    tls: &mut Option<Box<Session>>,
+    buf: &mut [u8],
+) -> io::Result<usize> {
+    match tls {
+        Some(session) => session.read_plain(socket, buf),
+        None => socket.read(buf),
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum StreamState {
     Alive,
@@ -1430,6 +1550,7 @@ impl FramedStream {
         event: &Event,
         config: &TcpGroupConfig,
         timers: &mut Option<NetworkTimers>,
+        tls: &mut Option<Box<Session>>,
         on_message: &mut F,
     ) -> StreamState
     where
@@ -1438,7 +1559,7 @@ impl FramedStream {
         if event.is_readable() {
             if config.framing == Framing::Raw {
                 loop {
-                    match self.socket.read(&mut self.rx_buffer) {
+                    match read_plaintext(&mut self.socket, tls, &mut self.rx_buffer) {
                         Ok(0) => return StreamState::Disconnected,
                         Ok(read) => on_message(&self.rx_buffer[..read], Nanos::now()),
                         Err(err) if err.kind() == io::ErrorKind::WouldBlock => break,
@@ -1450,7 +1571,7 @@ impl FramedStream {
                 }
             } else {
                 loop {
-                    match self.read_frame(config.max_frame_size) {
+                    match self.read_frame(config.max_frame_size, tls) {
                         ReadOutcome::Message { payload, send_ts } => {
                             if let Some(timers) = timers {
                                 if let Some(latency) = &mut timers.latency {
@@ -1464,6 +1585,17 @@ impl FramedStream {
                     }
                 }
             }
+            // Reads drive the handshake; flush whatever it wants to answer.
+            if let Some(session) = tls.as_mut() {
+                let mut pending = Vec::new();
+                session.take_pending(&mut pending);
+                if !pending.is_empty() &&
+                    self.write_frame(registry, None, &pending, config, timers) ==
+                        StreamState::Disconnected
+                {
+                    return StreamState::Disconnected;
+                }
+            }
         }
         if event.is_writable() && self.drain_queue(registry, config) == StreamState::Disconnected {
             return StreamState::Disconnected;
@@ -1474,12 +1606,16 @@ impl FramedStream {
         StreamState::Alive
     }
 
-    fn read_frame(&mut self, max_frame_size: usize) -> ReadOutcome<'_> {
+    fn read_frame(
+        &mut self,
+        max_frame_size: usize,
+        tls: &mut Option<Box<Session>>,
+    ) -> ReadOutcome<'_> {
         loop {
             match self.rx_state {
                 RxState::Header { mut bytes, mut have } => {
                     while have < FRAME_HEADER_SIZE {
-                        match self.socket.read(&mut bytes[have..]) {
+                        match read_plaintext(&mut self.socket, tls, &mut bytes[have..]) {
                             Ok(0) => return ReadOutcome::Disconnected,
                             Ok(read) => {
                                 have += read;
@@ -1522,7 +1658,11 @@ impl FramedStream {
                 }
                 RxState::Payload { length, mut have, send_ts } => {
                     while have < length {
-                        match self.socket.read(&mut self.rx_buffer[have..length]) {
+                        match read_plaintext(
+                            &mut self.socket,
+                            tls,
+                            &mut self.rx_buffer[have..length],
+                        ) {
                             Ok(0) => return ReadOutcome::Disconnected,
                             Ok(read) => {
                                 have += read;
@@ -1856,7 +1996,7 @@ mod tests {
         let group = TcpGroup(0);
         state.listen(group, (Ipv4Addr::LOCALHOST, 0).into()).unwrap();
         let addr = state.listeners[0].socket.local_addr().unwrap();
-        let _endpoint = state.connect(group, addr);
+        let _endpoint = state.connect(group, addr, None);
         assert_eq!(registered_fds(epoll_fd), 2);
 
         // Keep the listener's file description alive after its mio socket drops.

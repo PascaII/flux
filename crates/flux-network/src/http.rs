@@ -36,12 +36,14 @@
 //! may use `Content-Length`, chunked transfer coding, or EOF delimiting.
 //! `Expect: 100-continue` is handled automatically.
 //!
-//! TLS, HTTP/2, compression, trailer exposure, upgrades, and `WebSockets` are
-//! not supported. Valid response trailers are parsed and discarded. There is no
-//! half-close support. After an error response, the connection closes without a
-//! lingering-close delay. Pipelined requests are served strictly one at a time
-//! per connection.
+//! Server-side TLS, HTTP/2, compression, trailer exposure, upgrades, and
+//! `WebSockets` are not supported. Valid response trailers are parsed and
+//! discarded. There is no half-close support. After an error response, the
+//! connection closes without a lingering-close delay. Pipelined requests are
+//! served strictly one at a time per connection.
 
+#[cfg(feature = "tls")]
+use std::sync::Arc;
 use std::{
     collections::VecDeque,
     io::{self, Write as _},
@@ -53,6 +55,9 @@ use mio::Token;
 
 use crate::tcp::{Framing, TcpEvent, TcpGroup, TcpGroupConfig, TcpNetworkCore};
 
+/// Record overhead allowance on top of a full-size request; see `group`.
+const TLS_MARGIN_BYTES: usize = 64 * 1024;
+
 pub enum HttpEvent<'a> {
     Accepted { token: Token, peer_addr: SocketAddr },
     Connected { token: Token },
@@ -61,6 +66,25 @@ pub enum HttpEvent<'a> {
     Disconnected { token: Token },
     Failed { id: RequestId, reason: Failure },
 }
+
+impl<'a> HttpEvent<'a> {
+    /// The outcome this event carries for `pool`, if it finishes one of its
+    /// requests. Clients over a pool dispatch on this instead of matching the
+    /// response and failure variants themselves.
+    pub fn outcome(
+        &self,
+        pool: HttpPool,
+    ) -> Option<(RequestId, Result<&HttpResponse<'a>, Failure>)> {
+        match self {
+            Self::Response { id: Some(id), response, .. } if id.pool() == pool => {
+                Some((*id, Ok(response)))
+            }
+            Self::Failed { id, reason } if id.pool() == pool => Some((*id, Err(*reason))),
+            _ => None,
+        }
+    }
+}
+/// Persistent connections to one address sharing a request queue.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct HttpPool(u32);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -80,7 +104,8 @@ pub enum Failure {
 }
 struct Queued {
     id: RequestId,
-    method: String,
+    /// Whether the request was a `HEAD`, whose response carries no body.
+    head_request: bool,
     head: Vec<u8>,
     body: Vec<u8>,
     retries: u8,
@@ -103,8 +128,19 @@ enum State {
     Draining,
 }
 enum Role {
-    Accepted { state: State, close: bool, continued: bool, head_request: bool },
-    Outbound { addr: SocketAddr, method: Option<String>, in_flight: Option<InFlight> },
+    Accepted {
+        state: State,
+        close: bool,
+        continued: bool,
+        head_request: bool,
+    },
+    /// `in_flight_head` is `Some` while a request is awaiting its response,
+    /// carrying whether that request was a `HEAD`.
+    Outbound {
+        addr: SocketAddr,
+        in_flight_head: Option<bool>,
+        in_flight: Option<InFlight>,
+    },
 }
 struct Conn {
     token: Token,
@@ -132,6 +168,8 @@ pub struct HttpNetwork {
     pools: Vec<Pool>,
     max_queued_bytes: usize,
     request_timeout: Option<Duration>,
+    #[cfg(feature = "tls")]
+    tls_config: Option<Arc<crate::tls::ClientConfig>>,
     failed: Vec<(RequestId, Failure)>,
 }
 impl Default for HttpNetwork {
@@ -149,6 +187,8 @@ impl Default for HttpNetwork {
             pools: Vec::new(),
             max_queued_bytes: usize::MAX,
             request_timeout: None,
+            #[cfg(feature = "tls")]
+            tls_config: None,
             failed: Vec::new(),
         }
     }
@@ -207,6 +247,13 @@ impl HttpNetwork {
         self.request_timeout = Some(request_timeout);
         self
     }
+    /// Trusts `config` for TLS endpoints instead of the default Mozilla
+    /// roots. Applies to connections opened after the call.
+    #[cfg(feature = "tls")]
+    pub fn with_tls_config(mut self, config: Arc<crate::tls::ClientConfig>) -> Self {
+        self.tls_config = Some(config);
+        self
+    }
     pub fn max_body_bytes(&self) -> usize {
         self.max_body_bytes
     }
@@ -218,7 +265,13 @@ impl HttpNetwork {
                 framing: Framing::Raw,
                 socket_buf_size: *socket_buf_size,
                 max_frame_size: usize::MAX,
-                max_backlog_bytes: Some(max_head_bytes.saturating_add(*max_body_bytes)),
+                // The backlog counts wire bytes, which are ciphertext on a
+                // TLS endpoint: a record adds a header and a tag per 16KB.
+                // The margin keeps a full-size request from tripping the cap
+                // on its own overhead.
+                max_backlog_bytes: Some(
+                    max_head_bytes.saturating_add(*max_body_bytes).saturating_add(TLS_MARGIN_BYTES),
+                ),
                 backlog_warn_bytes: None,
                 ..Default::default()
             })
@@ -265,7 +318,7 @@ impl HttpNetwork {
             {
                 let limit = self.buffer_limit();
                 if let Some(conn) = self.conns.iter_mut().find(|conn| conn.token == token) &&
-                    !is_draining(&conn.role) &&
+                    !conn.role.is_draining() &&
                     !conn.over_limit
                 {
                     let available = limit.saturating_sub(conn.buf.len());
@@ -302,7 +355,7 @@ impl HttpNetwork {
         }
         self.parse_dirty(net, &mut handler);
         for conn in &mut self.conns {
-            if conn.over_limit && !is_draining(&conn.role) {
+            if conn.over_limit && !conn.role.is_draining() {
                 net.disconnect(conn.token);
                 conn.over_limit = false;
             }
@@ -329,10 +382,10 @@ impl HttpNetwork {
                 if in_flight.sent_at.elapsed() < timeout {
                     continue
                 }
-                if let Some(in_flight) = take_in_flight(&mut self.conns[i].role) {
+                if let Some(in_flight) = self.conns[i].role.take_in_flight() {
                     self.failed.push((in_flight.queued.id, Failure::TimedOut));
                 }
-                set_outbound_method(&mut self.conns[i].role, None);
+                self.conns[i].role.set_outbound_head(None);
                 net.disconnect(self.conns[i].token);
             }
         }
@@ -359,8 +412,8 @@ impl HttpNetwork {
                         let answered = self.parse_eof_outbound(i, handler);
                         self.conns[i].buf.clear();
                         self.conns[i].dirty = false;
-                        set_outbound_method(&mut self.conns[i].role, None);
-                        if let Some(in_flight) = take_in_flight(&mut self.conns[i].role) &&
+                        self.conns[i].role.set_outbound_head(None);
+                        if let Some(in_flight) = self.conns[i].role.take_in_flight() &&
                             !answered
                         {
                             self.requeue_or_fail(in_flight.queued);
@@ -396,25 +449,70 @@ impl HttpNetwork {
     pub fn connect(&mut self, net: &mut TcpNetworkCore, addr: SocketAddr) -> Token {
         let group = self.group(net);
         let token = net.connect(group, addr);
+        self.track_outbound(token, addr)
+    }
+    /// Like [`Self::connect`] but negotiates TLS once the TCP connect
+    /// completes, verifying against the Mozilla roots and sending SNI
+    /// `server`. Panics if `server` is not a valid DNS name or IP.
+    #[cfg(feature = "tls")]
+    pub fn connect_tls(
+        &mut self,
+        net: &mut TcpNetworkCore,
+        addr: SocketAddr,
+        server: &str,
+    ) -> Token {
+        let session = crate::tls::Session::new(server);
+        let session = match &self.tls_config {
+            Some(config) => session.with_config(config.clone()),
+            None => session,
+        };
+        let group = self.group(net);
+        let token = net.connect_tls(group, addr, session);
+        self.track_outbound(token, addr)
+    }
+    fn track_outbound(&mut self, token: Token, addr: SocketAddr) -> Token {
         self.conns.push(Conn {
             token,
             buf: Vec::new(),
             dirty: false,
             over_limit: false,
             last_activity: Instant::now(),
-            role: Role::Outbound { addr, method: None, in_flight: None },
+            role: Role::Outbound { addr, in_flight_head: None, in_flight: None },
         });
         token
     }
+    /// Opens `connections` persistent connections to `addr` that share one
+    /// request queue; see [`Self::send`].
     pub fn pool(
         &mut self,
         net: &mut TcpNetworkCore,
         addr: SocketAddr,
         connections: usize,
     ) -> HttpPool {
+        self.pool_with(net, addr, connections, |http, net| http.connect(net, addr))
+    }
+    /// Like [`Self::pool`] but negotiates TLS on every connection; see
+    /// [`Self::connect_tls`].
+    #[cfg(feature = "tls")]
+    pub fn pool_tls(
+        &mut self,
+        net: &mut TcpNetworkCore,
+        addr: SocketAddr,
+        server: &str,
+        connections: usize,
+    ) -> HttpPool {
+        self.pool_with(net, addr, connections, |http, net| http.connect_tls(net, addr, server))
+    }
+    fn pool_with(
+        &mut self,
+        net: &mut TcpNetworkCore,
+        addr: SocketAddr,
+        connections: usize,
+        mut open: impl FnMut(&mut Self, &mut TcpNetworkCore) -> Token,
+    ) -> HttpPool {
         assert!(connections > 0, "a pool needs a connection");
         let pool = HttpPool(self.pools.len() as u32);
-        let tokens = (0..connections).map(|_| self.connect(net, addr)).collect();
+        let tokens = (0..connections).map(|_| open(self, net)).collect();
         self.pools.push(Pool {
             addr,
             tokens,
@@ -460,18 +558,18 @@ impl HttpNetwork {
             return false
         }
         let Some(c) =
-            self.conns.iter_mut().find(|c| c.token == token && outbound_method(&c.role).is_none())
+            self.conns.iter_mut().find(|c| c.token == token && c.role.outbound_head().is_none())
         else {
             return false
         };
         let Role::Outbound { addr, .. } = &c.role else { return false };
-        let host = addr.to_string();
+        let addr = *addr;
         let sent = net.send_with(token, |out| {
-            write_head(out, method, path, headers, &host, body.len());
+            write_head(out, method, path, headers, &addr, body.len());
             out.extend_from_slice(body);
         });
         if sent {
-            set_outbound_method(&mut c.role, Some(method.to_owned()));
+            c.role.set_outbound_head(Some(method.eq_ignore_ascii_case("HEAD")));
         }
         sent
     }
@@ -492,14 +590,20 @@ impl HttpNetwork {
             return Err(body)
         }
         let mut head = Vec::new();
-        write_head(&mut head, method, path, headers, &p.addr.to_string(), body.len());
+        write_head(&mut head, method, path, headers, &p.addr, body.len());
         if p.queued_bytes + head.len() + body.len() > self.max_queued_bytes {
             return Err(body)
         }
         let id = RequestId { pool, seq: p.next_seq };
         p.next_seq += 1;
         p.queued_bytes += head.len() + body.len();
-        p.queue.push_back(Queued { id, method: method.to_owned(), head, body, retries });
+        p.queue.push_back(Queued {
+            id,
+            head_request: method.eq_ignore_ascii_case("HEAD"),
+            head,
+            body,
+            retries,
+        });
         Ok(id)
     }
     fn dispatch(&mut self, net: &mut TcpNetworkCore) {
@@ -509,7 +613,7 @@ impl HttpNetwork {
                 let Some(i) = self
                     .conns
                     .iter()
-                    .position(|c| c.token == token && outbound_method(&c.role).is_none())
+                    .position(|c| c.token == token && c.role.outbound_head().is_none())
                 else {
                     continue
                 };
@@ -523,7 +627,7 @@ impl HttpNetwork {
                 }
                 let queued = self.pools[p].queue.pop_front().unwrap();
                 self.pools[p].queued_bytes -= queued.head.len() + queued.body.len();
-                set_outbound_method(&mut self.conns[i].role, Some(queued.method.clone()));
+                self.conns[i].role.set_outbound_head(Some(queued.head_request));
                 if let Role::Outbound { in_flight, .. } = &mut self.conns[i].role {
                     *in_flight = Some(InFlight { queued, sent_at: Instant::now() });
                 }
@@ -543,7 +647,7 @@ impl HttpNetwork {
     fn fail_outbound(&mut self, net: &mut TcpNetworkCore, i: usize) {
         let token = self.conns[i].token;
         self.conns[i].buf.clear();
-        set_outbound_method(&mut self.conns[i].role, None);
+        self.conns[i].role.set_outbound_head(None);
         net.disconnect(token);
     }
     fn buffer_limit(&self) -> usize {
@@ -553,7 +657,7 @@ impl HttpNetwork {
     where
         F: for<'a> FnMut(HttpEvent<'a>),
     {
-        if !matches!(accepted_state_mut(&mut self.conns[i].role), State::Idle) {
+        if !matches!(self.conns[i].role.accepted_state_mut(), State::Idle) {
             return
         }
         let over_limit = self.conns[i].over_limit;
@@ -603,12 +707,12 @@ impl HttpNetwork {
                 return
             }
             if has_token(req.headers, "expect", b"100-continue") &&
-                !accepted_continued_mut(&self.conns[i].role)
+                !self.conns[i].role.accepted_continued()
             {
                 let token = self.conns[i].token;
                 if net.send_with(token, |out| write!(out, "HTTP/1.1 100 Continue\r\n\r\n").unwrap())
                 {
-                    set_accepted_continued(&mut self.conns[i].role, true);
+                    self.conns[i].role.set_accepted_continued(true);
                 }
             }
             return
@@ -627,14 +731,14 @@ impl HttpNetwork {
         handler(HttpEvent::Request { token, request });
         self.conns[i].buf.drain(..end);
         self.conns[i].dirty = !self.conns[i].buf.is_empty();
-        set_accepted_state(&mut self.conns[i].role, State::Pending);
-        set_accepted_close(&mut self.conns[i].role, close);
-        set_accepted_continued(&mut self.conns[i].role, false);
-        set_accepted_head_request(&mut self.conns[i].role, head_request);
+        self.conns[i].role.set_accepted_state(State::Pending);
+        self.conns[i].role.set_accepted_close(close);
+        self.conns[i].role.set_accepted_continued(false);
+        self.conns[i].role.set_accepted_head_request(head_request);
     }
     fn error(&mut self, net: &mut TcpNetworkCore, i: usize, status: u16) {
-        set_accepted_state(&mut self.conns[i].role, State::Pending);
-        set_accepted_close(&mut self.conns[i].role, true);
+        self.conns[i].role.set_accepted_state(State::Pending);
+        self.conns[i].role.set_accepted_close(true);
         let token = self.conns[i].token;
         let _ = self.respond(net, token, status, &[], &[]);
     }
@@ -654,7 +758,7 @@ impl HttpNetwork {
         let Some(i) = self
             .conns
             .iter()
-            .position(|c| c.token == token && matches!(accepted_state(&c.role), State::Pending))
+            .position(|c| c.token == token && matches!(c.role.accepted_state(), State::Pending))
         else {
             return false
         };
@@ -671,9 +775,9 @@ impl HttpNetwork {
         let caller_close = headers.iter().any(|(n, v)| {
             n.eq_ignore_ascii_case("connection") && has_value_token(v.as_bytes(), b"close")
         });
-        let close = accepted_close(&self.conns[i].role) || caller_close;
+        let close = self.conns[i].role.accepted_close() || caller_close;
         let suppress_body =
-            accepted_head_request(&self.conns[i].role) || matches!(status, 100..=199 | 204 | 304);
+            self.conns[i].role.accepted_head_request() || matches!(status, 100..=199 | 204 | 304);
         let include_length = !matches!(status, 100..=199 | 204);
         let ok = net.send_with(token, |out| {
             write!(out, "HTTP/1.1 {status} {}\r\n", reason_phrase(status)).unwrap();
@@ -703,10 +807,11 @@ impl HttpNetwork {
         });
         if ok {
             self.conns[i].dirty = !close && !self.conns[i].buf.is_empty();
-            set_accepted_state(
-                &mut self.conns[i].role,
-                if close { State::Draining } else { State::Idle },
-            );
+            self.conns[i].role.set_accepted_state(if close {
+                State::Draining
+            } else {
+                State::Idle
+            });
             if close {
                 net.disconnect_when_drained(token);
             }
@@ -718,7 +823,7 @@ impl HttpNetwork {
         F: for<'a> FnMut(HttpEvent<'a>),
     {
         self.conns[i].dirty = false;
-        while outbound_method(&self.conns[i].role).is_some() {
+        while self.conns[i].role.outbound_head().is_some() {
             let b = &self.conns[i].buf;
             let mut hs = vec![httparse::EMPTY_HEADER; self.max_headers];
             let mut response = httparse::Response::new(&mut hs);
@@ -739,7 +844,7 @@ impl HttpNetwork {
                 return
             }
             let status = response.code.unwrap_or(0);
-            let no_body = outbound_method(&self.conns[i].role).map(String::as_str) == Some("HEAD") ||
+            let no_body = self.conns[i].role.outbound_head() == Some(true) ||
                 matches!(status, 100..=199 | 204 | 304);
             let chunked = transfer_chunked(response.headers);
             let content_length = response_content_length(response.headers);
@@ -788,7 +893,7 @@ impl HttpNetwork {
                 continue
             }
             let token = self.conns[i].token;
-            let id = in_flight_id(&self.conns[i].role);
+            let id = self.conns[i].role.in_flight_id();
             let close = response.version == Some(0) &&
                 !has_token(response.headers, "connection", b"keep-alive") ||
                 has_token(response.headers, "connection", b"close");
@@ -808,8 +913,8 @@ impl HttpNetwork {
             handler(HttpEvent::Response { token, id, response: response_event });
             self.conns[i].buf.drain(..consumed);
             self.conns[i].dirty = !self.conns[i].buf.is_empty();
-            set_outbound_method(&mut self.conns[i].role, None);
-            take_in_flight(&mut self.conns[i].role);
+            self.conns[i].role.set_outbound_head(None);
+            self.conns[i].role.take_in_flight();
             if close {
                 net.disconnect(token);
                 return
@@ -820,7 +925,7 @@ impl HttpNetwork {
     where
         F: for<'a> FnMut(HttpEvent<'a>),
     {
-        if outbound_method(&self.conns[i].role).is_none() {
+        if self.conns[i].role.outbound_head().is_none() {
             return false
         }
         let b = &self.conns[i].buf;
@@ -831,7 +936,7 @@ impl HttpNetwork {
             return false
         }
         let status = response.code.unwrap_or(0);
-        let no_body = outbound_method(&self.conns[i].role).map(String::as_str) == Some("HEAD") ||
+        let no_body = self.conns[i].role.outbound_head() == Some(true) ||
             matches!(status, 100..=199 | 204 | 304);
         if no_body ||
             transfer_chunked(response.headers) != Some(false) ||
@@ -843,7 +948,7 @@ impl HttpNetwork {
         let token = self.conns[i].token;
         handler(HttpEvent::Response {
             token,
-            id: in_flight_id(&self.conns[i].role),
+            id: self.conns[i].role.in_flight_id(),
             response: HttpResponse {
                 version: response.version.unwrap_or(1),
                 status,
@@ -964,12 +1069,14 @@ fn valid_request(method: &str, path: &str, headers: &[(&str, &str)]) -> bool {
                 !n.eq_ignore_ascii_case("transfer-encoding")
         })
 }
+/// Writes a request head, defaulting `Host` to the endpoint address when the
+/// caller did not supply one.
 fn write_head(
     out: &mut impl io::Write,
     method: &str,
     path: &str,
     headers: &[(&str, &str)],
-    host: &str,
+    addr: &SocketAddr,
     body_len: usize,
 ) {
     write!(out, "{method} {path} HTTP/1.1\r\n").unwrap();
@@ -979,73 +1086,75 @@ fn write_head(
         write!(out, "{n}: {v}\r\n").unwrap();
     }
     if !has_host {
-        write!(out, "Host: {host}\r\n").unwrap();
+        write!(out, "Host: {addr}\r\n").unwrap();
     }
     write!(out, "Content-Length: {body_len}\r\n\r\n").unwrap();
 }
-fn in_flight_id(role: &Role) -> Option<RequestId> {
-    match role {
-        Role::Outbound { in_flight: Some(in_flight), .. } => Some(in_flight.queued.id),
-        _ => None,
+impl Role {
+    fn in_flight_id(&self) -> Option<RequestId> {
+        match self {
+            Self::Outbound { in_flight: Some(in_flight), .. } => Some(in_flight.queued.id),
+            _ => None,
+        }
     }
-}
-fn take_in_flight(role: &mut Role) -> Option<InFlight> {
-    match role {
-        Role::Outbound { in_flight, .. } => in_flight.take(),
-        Role::Accepted { .. } => None,
+    fn take_in_flight(&mut self) -> Option<InFlight> {
+        match self {
+            Self::Outbound { in_flight, .. } => in_flight.take(),
+            Self::Accepted { .. } => None,
+        }
     }
-}
-fn accepted_state(role: &Role) -> State {
-    match role {
-        Role::Accepted { state, .. } => *state,
-        Role::Outbound { .. } => State::Draining,
+    fn accepted_state(&self) -> State {
+        match self {
+            Self::Accepted { state, .. } => *state,
+            Self::Outbound { .. } => State::Draining,
+        }
     }
-}
-fn accepted_state_mut(role: &mut Role) -> &mut State {
-    match role {
-        Role::Accepted { state, .. } => state,
-        Role::Outbound { .. } => panic!("accepted role"),
+    fn accepted_state_mut(&mut self) -> &mut State {
+        match self {
+            Self::Accepted { state, .. } => state,
+            Self::Outbound { .. } => panic!("accepted role"),
+        }
     }
-}
-fn is_draining(role: &Role) -> bool {
-    matches!(role, Role::Accepted { state: State::Draining, .. })
-}
-fn set_accepted_state(role: &mut Role, state: State) {
-    *accepted_state_mut(role) = state;
-}
-fn accepted_close(role: &Role) -> bool {
-    matches!(role, Role::Accepted { close: true, .. })
-}
-fn set_accepted_close(role: &mut Role, close: bool) {
-    if let Role::Accepted { close: current, .. } = role {
-        *current = close;
+    fn is_draining(&self) -> bool {
+        matches!(self, Self::Accepted { state: State::Draining, .. })
     }
-}
-fn accepted_continued_mut(role: &Role) -> bool {
-    matches!(role, Role::Accepted { continued: true, .. })
-}
-fn set_accepted_continued(role: &mut Role, continued: bool) {
-    if let Role::Accepted { continued: current, .. } = role {
-        *current = continued;
+    fn set_accepted_state(&mut self, state: State) {
+        *self.accepted_state_mut() = state;
     }
-}
-fn accepted_head_request(role: &Role) -> bool {
-    matches!(role, Role::Accepted { head_request: true, .. })
-}
-fn set_accepted_head_request(role: &mut Role, head_request: bool) {
-    if let Role::Accepted { head_request: current, .. } = role {
-        *current = head_request;
+    fn accepted_close(&self) -> bool {
+        matches!(self, Self::Accepted { close: true, .. })
     }
-}
-fn outbound_method(role: &Role) -> Option<&String> {
-    match role {
-        Role::Outbound { method, .. } => method.as_ref(),
-        Role::Accepted { .. } => None,
+    fn set_accepted_close(&mut self, close: bool) {
+        if let Self::Accepted { close: current, .. } = self {
+            *current = close;
+        }
     }
-}
-fn set_outbound_method(role: &mut Role, method: Option<String>) {
-    if let Role::Outbound { method: current, .. } = role {
-        *current = method;
+    fn accepted_continued(&self) -> bool {
+        matches!(self, Self::Accepted { continued: true, .. })
+    }
+    fn set_accepted_continued(&mut self, continued: bool) {
+        if let Self::Accepted { continued: current, .. } = self {
+            *current = continued;
+        }
+    }
+    fn accepted_head_request(&self) -> bool {
+        matches!(self, Self::Accepted { head_request: true, .. })
+    }
+    fn set_accepted_head_request(&mut self, head_request: bool) {
+        if let Self::Accepted { head_request: current, .. } = self {
+            *current = head_request;
+        }
+    }
+    fn outbound_head(&self) -> Option<bool> {
+        match self {
+            Self::Outbound { in_flight_head, .. } => *in_flight_head,
+            Self::Accepted { .. } => None,
+        }
+    }
+    fn set_outbound_head(&mut self, head_request: Option<bool>) {
+        if let Self::Outbound { in_flight_head: current, .. } = self {
+            *current = head_request;
+        }
     }
 }
 
